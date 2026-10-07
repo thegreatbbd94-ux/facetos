@@ -1,0 +1,9 @@
+# build output
+*.o
+*.elf
+*.iso
+iso_root/
+# downloaded at build time
+limine/
+# generated previews
+tools/assets_preview.png
