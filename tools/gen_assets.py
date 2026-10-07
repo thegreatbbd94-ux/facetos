@@ -207,6 +207,31 @@ def icon_sound():
         d.arc((72 - r + 10, 64 - r, 72 + r + 10, 64 + r), -50, 50, fill=(74, 91, 214, 255), width=6)
     return shadow(im)
 
+def icon_calc():
+    im = vgrad((128, 128), (18, 6, 110, 122), (92, 98, 112), (48, 52, 62), 12)
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((18, 6, 110, 122), 12, outline=INK, width=4)
+    d.rounded_rectangle((28, 16, 100, 42), 5, fill=(196, 226, 180, 255), outline=(20, 30, 20, 255), width=3)
+    d.text((62, 17), '42', fill=(30, 50, 30, 255), font=ImageFont.truetype(FD + 'DejaVuSans-Bold.ttf', 20))
+    for r in range(4):
+        for c in range(4):
+            x, y = 28 + c * 19, 52 + r * 17
+            col = (74, 91, 214, 255) if c == 3 else (236, 238, 242, 255)
+            d.rounded_rectangle((x, y, x + 14, y + 12), 3, fill=col, outline=(20, 22, 30, 255), width=2)
+    return shadow(im)
+
+def icon_floppy():
+    im = vgrad((128, 128), (14, 10, 114, 118), (98, 118, 230), (52, 66, 170), 8)
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((14, 10, 114, 118), 8, outline=INK, width=4)
+    d.rectangle((38, 10, 92, 46), fill=(206, 212, 222, 255), outline=INK, width=4)
+    d.rectangle((72, 16, 84, 40), fill=(70, 76, 90, 255))
+    d.rounded_rectangle((28, 62, 100, 116), 4, fill=(255, 255, 255, 255), outline=INK, width=3)
+    for y in (76, 88, 100):
+        d.line([(36, y), (92, y)], fill=(150, 156, 168, 255), width=3)
+    d.polygon([(64, 66), (72, 72), (64, 82), (56, 72)], fill=(94, 234, 212, 255))
+    return shadow(im)
+
 def gem(n=512, shadowed=False):
     im, d = canvas(n)
     k = n / 128
@@ -260,16 +285,17 @@ font('F_BIG', 'DejaVuSans-Bold.ttf', 22)
 for nm, fn in [('IC_DISK', icon_disk), ('IC_NOTES', icon_doc), ('IC_README', icon_readme),
                ('IC_PAINT', icon_paint), ('IC_TRASH', icon_trash), ('IC_PUZZLE', icon_puzzle),
                ('IC_COMPUTER', icon_computer), ('IC_MOUSE', icon_mouse), ('IC_KEYBOARD', icon_keyboard),
-               ('IC_CLOCK', icon_clock), ('IC_SOUND', icon_sound)]:
+               ('IC_CLOCK', icon_clock), ('IC_SOUND', icon_sound),
+               ('IC_CALC', icon_calc), ('IC_FLOPPY', icon_floppy)]:
     emit(nm, fn(), 32)
 emit('GEM_BIG', gem(512, True), 72)
 emit('GEM_SMALL', gem(512), 18)
 emit_rect('WORDMARK', wordmark(), 190)
 # preview sheet for checking
-sheet = Image.new('RGBA', (520, 140), (200, 205, 215, 255))
+sheet = Image.new('RGBA', (600, 140), (200, 205, 215, 255))
 x = 4
 for fn in [icon_disk, icon_doc, icon_readme, icon_paint, icon_trash, icon_puzzle, icon_computer,
-           icon_mouse, icon_keyboard, icon_clock, icon_sound]:
+           icon_mouse, icon_keyboard, icon_clock, icon_sound, icon_calc, icon_floppy]:
     sheet.alpha_composite(fn().resize((32, 32), Image.LANCZOS), (x, 4)); x += 40
 sheet.alpha_composite(gem(512, True).resize((72, 72), Image.LANCZOS), (4, 44))
 wm = wordmark(); wm = wm.resize((190, round(wm.height * 190 / wm.width)), Image.LANCZOS)

@@ -2,6 +2,7 @@
 *.o
 *.elf
 *.iso
+facetos-disk.img
 iso_root/
 # downloaded at build time
 limine/
