@@ -1,53 +1,53 @@
 # FacetOS
 
 **A tiny 32-bit desktop operating system that draws every pixel itself.**
-No Linux, no libraries — one C file, some pixel art, and a bootloader.
-Built entirely on an Android phone with Termux.
+No Linux, no libraries — one C file, original artwork, and a bootloader.
+Designed by one person, coded with Claude, built and tested on an Android phone with Termux.
 
 ![FacetOS desktop](screenshots/desktop.png)
 
-## What's new in 1.1
+## What's new in 1.2 "Prism"
 
-- **Saving files** — Notes saves `.TXT` files and Paint saves `.BMP` pictures to the **Facet Disk**
-- **Facet Disk** window — see your files, double-click to open, *File > Delete File* to remove
-- **Real file system** — FAT16, the same family USB sticks use, so the disk image opens on other computers too
-- **Disk driver** — ATA hard disk driver written from scratch
-- **Interrupts** — keyboard, mouse and timer now use interrupts, so the CPU rests when nothing happens
-- **Calculator** — works with the mouse or the keyboard
-- **Dialogs** — Save, Delete and error messages
-- **Crash screen** — if the CPU hits an error you get a friendly message instead of a frozen screen
+FacetOS now has a look of its own:
 
-| Saving a note | Apps |
+- **Dark glass windows with cut corners**, like the facets of a gem, and a teal-to-violet **prism accent**
+- **The Prism Bar** — a floating bar at the bottom: the gem opens the app launcher, every app is one click away, and a glowing line shows which app is in front
+- **Window animations** — a shimmer of light when a window opens, and the window **shatters into pieces** when you close it (can be turned off in Settings)
+- **New boot animation** — a beam of light hits the gem and splits into a spectrum
+- **New icons, font (Inter) and cursor**, all designed for FacetOS
+- **Live mode** — FacetOS runs like a live USB: files you save go to the **Vault** and stay until you shut down
+- **Hardware detection** — the System app lists the disks, CD drives, SATA/NVMe/USB controllers it finds
+- **Safe by design** — FacetOS never formats or overwrites a disk. It only saves to a disk that is already a FacetOS disk
+
+| Apps | Launcher |
 |---|---|
-| ![Save dialog](screenshots/save.png) | ![Apps](screenshots/apps.png) |
+| ![Apps](screenshots/apps.png) | ![Launcher](screenshots/launcher.png) |
 
-## Features
+| Boot: the light beam | Boot: starting up |
+|---|---|
+| ![Boot beam](screenshots/boot-beam.png) | ![Boot](screenshots/boot.png) |
 
-- **Boot animation** — the gem logo fades in with a startup chime, then a progress panel while each part of the system starts up
-- **Classic desktop** — menu bar with a clock, striped title bars, drop shadows, desktop icons, five wallpapers
-- **Window manager** — drag windows by the title bar, close box, roll-up box (or double-click a title bar)
-- **Apps** — About FacetOS, Facet HD, Facet Disk, Notes, Paint, Calculator, Puzzle, Read Me, Trash
-- **Drivers written from scratch** — PS/2 mouse and keyboard, ATA disk, PIT timer, CMOS clock, PC speaker
-- Runs at 1024×768 in 32-bit color with anti-aliased text
+![System app showing the detected hardware](screenshots/system.png)
+
+## Apps
+
+**System** (hardware info and storage) · **Vault** (your files) · **Notes** · **Paint** · **Calculator** · **Puzzle** · **Settings** (wallpapers, animations) · **Read Me** · **Bin**
 
 ## Try it
 
-You need two files from the [Releases](../../releases) page (or build them yourself, below):
+Download `facetos.iso` from the [Releases](../../releases) page, or build it yourself (below). Then boot it:
 
-- `facetos.iso` — the operating system (a CD image)
-- `facetos-disk.img` — the Facet Disk where your files are saved (a hard disk image)
+- **In your browser with v86:** open [copy.sh/v86](https://copy.sh/v86/), choose `facetos.iso` as the **CD image**, press Start
+- **QEMU:** `qemu-system-x86_64 -cdrom facetos.iso -m 128`
+- **VirtualBox:** new VM (Other, 32-bit), attach the ISO as a CD
+- **A real PC:** write the ISO to a USB stick with Rufus or Ventoy and boot from it. It runs as a live system; your disks are detected but never changed. (The mouse and keyboard need PS/2 or USB legacy support in the BIOS.)
 
-Then boot it in:
+FacetOS needs about 32 MB of memory.
 
-- **v86** in your browser: open [copy.sh/v86](https://copy.sh/v86/), pick `facetos.iso` as the **CD image** and `facetos-disk.img` as the **hard disk image**, press Start. To keep your files, download the hard disk image again before closing the page (v86's "Get hard disk image" button) and use that file next time.
-- **QEMU** (files are saved straight into the disk file):
-  `qemu-system-x86_64 -cdrom facetos.iso -hda facetos-disk.img -boot d -m 128`
-- **VirtualBox**: new VM (Other, 32-bit), attach the ISO as a CD; convert the disk with `VBoxManage convertfromraw facetos-disk.img facetos-disk.vdi` and attach it as a hard disk
-- **A real PC**: write the ISO to a USB stick with Rufus or Ventoy (needs a PS/2-compatible mouse/keyboard; files can only be saved to an IDE/ATA disk)
+### Where do my files go?
 
-FacetOS works without the disk too — you just can't save.
-
-**Safety:** FacetOS only writes to a disk that is completely blank (it sets it up as a Facet Disk) or one it set up before. Any other disk is left untouched.
+- **Normally (live mode):** in the Vault, in memory, until you shut down — like a live USB.
+- **If a FacetOS disk is attached** (for example a `facetos-disk.img` made with FacetOS 1.1), the Vault saves to that disk and your files survive restarts.
 
 ## Build it
 
@@ -64,7 +64,7 @@ bash build.sh
 
 Install `clang`, `lld`, `make`, `git` and `xorriso` with your package manager, then run `bash build.sh`.
 
-The build downloads the [Limine](https://github.com/limine-bootloader/limine) bootloader automatically and makes `facetos.iso`. The first time, it also makes a blank `facetos-disk.img` — later builds never overwrite it, so your saved files are safe.
+The build downloads the [Limine](https://github.com/limine-bootloader/limine) bootloader automatically and makes `facetos.iso`.
 
 ## How it works
 
@@ -74,27 +74,27 @@ The build downloads the [Limine](https://github.com/limine-bootloader/limine) bo
 | `assets.h` | Fonts, icons and logo as data (generated by `tools/gen_assets.py`) |
 | `linker.ld` | Tells the linker to load the kernel at 2 MB |
 | `limine.conf` | Tells Limine to boot the kernel with the Multiboot2 protocol |
-| `build.sh` | Compiles everything and makes the bootable ISO and the disk image |
+| `build.sh` | Compiles everything and makes the bootable ISO |
 
-Boot flow: **BIOS/UEFI → Limine → Multiboot2 → `kmain()`**. Limine switches the screen into a 1024×768 graphics mode and passes its address to the kernel. FacetOS then sets up its own GDT and interrupt table, remaps the PIC, starts a 1000 Hz timer, finds the disk and mounts the FAT16 file system. Everything on screen is drawn into a back buffer and only the changed parts are copied to the screen.
+Boot flow: **BIOS/UEFI → Limine → Multiboot2 → `kmain()`**. FacetOS sets up its own GDT and interrupt table, starts a 1000 Hz timer, reads the PS/2 keyboard and mouse through interrupts, scans the PCI bus, probes the ATA drives, and mounts the Vault. Everything on screen is drawn into a back buffer and only the changed parts are copied to the screen.
 
-To change the icons or fonts, edit `tools/gen_assets.py` and run `python3 tools/gen_assets.py` from the repo root (needs Python with Pillow and the DejaVu fonts installed).
+To change the icons or fonts, edit `tools/gen_assets.py` and run `python3 tools/gen_assets.py` (needs Python with Pillow).
 
 ## Roadmap
 
-- [x] Interrupts (IDT) instead of polling
-- [x] Disk driver + FAT file system, so Notes and Paint can save
-- [x] Calculator
-- [ ] Folders on the Facet Disk
-- [ ] Paging / memory protection
-- [ ] Multitasking
-- [ ] Loading separate app programs
-- [ ] More games
+- [x] Interrupts, disk driver, FAT16 file system, saving
+- [x] A design language of its own ("Prism")
+- [ ] AHCI (SATA) and NVMe drivers, to read modern disks
+- [ ] USB keyboard and mouse
+- [ ] Folders in the Vault
+- [ ] Multitasking and separate app programs
+- [ ] Games
 
 ## Credits
 
+- Designed by the FacetOS author, coded with Claude (Anthropic)
 - Bootloader: [Limine](https://github.com/limine-bootloader/limine)
-- Fonts: DejaVu Sans, rasterized into bitmaps (license in `licenses/DejaVu-Fonts.txt`)
+- Font: [Inter](https://rsms.me/inter/) by Rasmus Andersson (SIL Open Font License, `licenses/Inter-OFL.txt`)
 - Icons, logo and everything else: original FacetOS artwork
 
 Licensed under the [MIT License](LICENSE).
