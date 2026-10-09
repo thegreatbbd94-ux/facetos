@@ -1,10 +1,11 @@
 /*
- * FacetOS 1.2 "Prism" - a tiny 32-bit desktop operating system that draws every pixel itself.
- * Classic desktop style, original art. Boots via Multiboot2 (Limine / GRUB) on any x86 PC,
+ * FacetOS 1.3 "Prism" - a tiny 32-bit desktop operating system that draws every pixel itself.
+ * Original art. Boots via Multiboot2 (Limine / GRUB) on BIOS and UEFI PCs,
  * including 32-bit-only emulators like v86.
  *
- * 1.2: a new look of its own (dark glass, cut corners, Prism Bar, prism accent), window
- * animations, a live "Vault" that keeps files in memory, and read-only hardware detection.
+ * 1.2: a look of its own (dark glass, cut corners, Prism Bar), window animations, the Vault.
+ * 1.3: UEFI boot, any screen size with 2x scaling, ACPI power off, USB keyboard + mouse (xHCI),
+ *      Settings with tabs, a hardware report, keyboard shortcuts and a Safe mode.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -17,7 +18,7 @@ typedef struct { const Glyph *g; const char *a; int lh; } Font;
 typedef struct { int w, h; const u32 *pal; const char *d; } Image;
 #include "assets.h"
 
-#define VERSION "1.2"
+#define VERSION "1.3"
 
 /* ====================================================================
  *  Boot: Multiboot2 header + entry point
@@ -26,7 +27,7 @@ typedef struct { int w, h; const u32 *pal; const char *d; } Image;
 __attribute__((section(".multiboot"), aligned(8), used))
 static const u32 mb2_header[] = {
     MB2_MAGIC, 0, 48, (u32)(0u - (MB2_MAGIC + 0u + 48u)),
-    5 | (0 << 16), 20, 1024, 768, 32, 0,      /* framebuffer tag: 1024x768x32 */
+    5 | (0 << 16), 20, 0, 0, 32, 0,           /* framebuffer tag: any size (the loader picks), 32-bit colour */
     0, 8,                                      /* end tag */
 };
 __asm__(
@@ -38,11 +39,58 @@ __asm__(
 static inline void outb(u16 p, u8 v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
 static inline void outw(u16 p, u16 v) { __asm__ volatile("outw %0, %1" :: "a"(v), "Nd"(p)); }
 static inline u8 inb(u16 p) { u8 v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(p)); return v; }
+static inline u16 inw_(u16 p) { u16 v; __asm__ volatile("inw %1, %0" : "=a"(v) : "Nd"(p)); return v; }
 static inline void outl_(u16 p, u32 v) { __asm__ volatile("outl %0, %1" :: "a"(v), "Nd"(p)); }
 static inline u32 inl_(u16 p) { u32 v; __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(p)); return v; }
 static inline void cli(void) { __asm__ volatile("cli"); }
 static inline void sti(void) { __asm__ volatile("sti"); }
 static void halt(void) { for (;;) __asm__ volatile("cli; hlt"); }
+
+/* a very small memory allocator: hands out pieces of one big free RAM area, never frees */
+extern char _kernel_end[];
+static u32 heap_ptr, heap_end;
+static void *kalloc(u32 n) {
+    n = (n + 4095) & ~4095u;
+    if (!heap_ptr || heap_end - heap_ptr < n) return 0;
+    void *p = (void *)heap_ptr; heap_ptr += n;
+    return p;
+}
+/* Paging (PAE) is only switched on when a device lives above 4 GB, which a 32-bit CPU mode can't
+ * reach directly. All memory stays mapped 1:1; a device above 4 GB gets a window inside our heap. */
+static u64 *pae_pd; static u64 pae_pdpt[4] __attribute__((aligned(32)));
+static bool paging_on;
+static void paging_enable(void) {
+    u32 raw = (u32)kalloc(4 * 4096);
+    if (!raw) return;
+    pae_pd = (u64 *)raw;
+    for (u32 i = 0; i < 2048; i++) pae_pd[i] = ((u64)i << 21) | 0x83;          /* 2 MB pages: present, writable */
+    for (int i = 0; i < 4; i++) pae_pdpt[i] = (u32)&pae_pd[i * 512] | 1;
+    __asm__ volatile(
+        "mov %%cr4, %%eax\n or $0x20, %%eax\n mov %%eax, %%cr4\n"             /* PAE on */
+        "mov %0, %%cr3\n"
+        "mov %%cr0, %%eax\n or $0x80000000, %%eax\n mov %%eax, %%cr0\n"       /* paging on */
+        :: "r"((u32)pae_pdpt) : "eax", "memory");
+    paging_on = true;
+}
+/* make a physical address range usable; returns the address to use from now on (0 = failed) */
+static u32 map_phys(u64 phys, u32 size) {
+    if (phys + size <= 0x100000000ull) return (u32)phys;
+    if (!paging_on) paging_enable();
+    if (!paging_on) return 0;
+    u64 base = phys & ~0x1FFFFFull;
+    u32 off = (u32)(phys - base), span = (off + size + 0x1FFFFF) & ~0x1FFFFFu;
+    u32 raw = (u32)kalloc(span + 0x200000);
+    if (!raw) return 0;
+    u32 va = (raw + 0x1FFFFF) & ~0x1FFFFFu;
+    for (u32 k = 0; k < span >> 21; k++)
+        pae_pd[(va >> 21) + k] = (base + ((u64)k << 21)) | 0x9B;          /* + no caching for devices */
+    __asm__ volatile("mov %%cr3, %%eax\n mov %%eax, %%cr3" ::: "eax", "memory");
+    return va + off;
+}
+/* MMIO helpers: device registers that live in memory */
+static inline u32 mmio_r32(u32 a) { return *(volatile u32 *)a; }
+static inline void mmio_w32(u32 a, u32 v) { *(volatile u32 *)a = v; }
+static inline void mmio_w64(u32 a, u64 v) { *(volatile u32 *)a = (u32)v; *(volatile u32 *)(a + 4) = (u32)(v >> 32); }
 
 void *memset(void *d, int c, size_t n) { u8 *p = d; while (n--) *p++ = (u8)c; return d; }
 void *memcpy(void *d, const void *s, size_t n) { u8 *a = d; const u8 *b = s; while (n--) *a++ = *b++; return d; }
@@ -169,12 +217,16 @@ static void beep(void) { tone(440); sleep_ms(70); tone(0); }
 /* ====================================================================
  *  Graphics core: everything is drawn into a back buffer, then copied
  * ==================================================================== */
-#define MAXW 1280
-#define MAXH 1024
-static u32 bb[MAXW * MAXH];          /* composed scene */
-static u32 bgbuf[MAXW * MAXH];       /* desktop wallpaper */
+static u32 *bb, *bgbuf;              /* composed scene and desktop wallpaper (allocated at boot) */
+static int BW;                       /* width of one row in bb / bgbuf, in pixels */
 static u32 *fb; static u32 fb_stride;
-static int W, H;
+static int W, H;                     /* the screen size FacetOS draws at (logical pixels) */
+static int PW, PH;                   /* the real screen size */
+static int SCALE = 1;                /* 2 = every logical pixel becomes 2x2 real pixels (HiDPI) */
+static inline void fbpx(int x, int y, u32 c) {     /* put one logical pixel straight onto the screen */
+    if (SCALE == 1) { fb[y * fb_stride + x] = c; return; }
+    u32 *p = &fb[(y * 2) * fb_stride + x * 2]; p[0] = p[1] = c; p[fb_stride] = p[fb_stride + 1] = c;
+}
 static int cx0, cy0, cx1, cy1;       /* clip rectangle */
 
 static void clip_set(int x, int y, int w, int h) {
@@ -198,21 +250,21 @@ static u32 mix(u32 c1, u32 c2, int t, int n) {   /* t/n of the way from c1 to c2
     return (u32)(r << 16 | g << 8 | b);
 }
 static inline void pblend(int x, int y, u32 c, u32 a) {
-    if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1) { u32 *p = &bb[y * MAXW + x]; *p = blend(*p, c, a); }
+    if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1) { u32 *p = &bb[y * BW + x]; *p = blend(*p, c, a); }
 }
 #define CLIPRECT int x0 = imax(x, cx0), y0 = imax(y, cy0), x1 = imin(x + w, cx1), y1 = imin(y + h, cy1)
 static void fill(int x, int y, int w, int h, u32 c) {
     CLIPRECT;
-    for (int j = y0; j < y1; j++) { u32 *r = &bb[j * MAXW]; for (int i = x0; i < x1; i++) r[i] = c; }
+    for (int j = y0; j < y1; j++) { u32 *r = &bb[j * BW]; for (int i = x0; i < x1; i++) r[i] = c; }
 }
 static void fill_a(int x, int y, int w, int h, u32 c, u32 a) {
     CLIPRECT;
-    for (int j = y0; j < y1; j++) { u32 *r = &bb[j * MAXW]; for (int i = x0; i < x1; i++) r[i] = blend(r[i], c, a); }
+    for (int j = y0; j < y1; j++) { u32 *r = &bb[j * BW]; for (int i = x0; i < x1; i++) r[i] = blend(r[i], c, a); }
 }
 static void gradient(int x, int y, int w, int h, u32 c1, u32 c2) {
     CLIPRECT;
     for (int j = y0; j < y1; j++) {
-        u32 c = mix(c1, c2, j - y, h > 1 ? h - 1 : 1), *r = &bb[j * MAXW];
+        u32 c = mix(c1, c2, j - y, h > 1 ? h - 1 : 1), *r = &bb[j * BW];
         for (int i = x0; i < x1; i++) r[i] = c;
     }
 }
@@ -321,7 +373,15 @@ static bool ol_on; static int ol_x, ol_y, ol_w, ol_h;
 static void blit(int x, int y, int w, int h) {     /* back buffer -> screen */
     int x0 = imax(x, 0), y0 = imax(y, 0), x1 = imin(x + w, W), y1 = imin(y + h, H);
     if (x1 <= x0) return;
-    for (int j = y0; j < y1; j++) copy32(&fb[j * fb_stride + x0], &bb[j * MAXW + x0], (u32)(x1 - x0));
+    if (SCALE == 1) {
+        for (int j = y0; j < y1; j++) copy32(&fb[j * fb_stride + x0], &bb[j * BW + x0], (u32)(x1 - x0));
+        return;
+    }
+    for (int j = y0; j < y1; j++) {                  /* 2x: double every pixel and every row */
+        u32 *src = &bb[j * BW + x0], *d = &fb[(j * 2) * fb_stride + x0 * 2];
+        for (int i = 0; i < x1 - x0; i++) { u32 c = src[i]; d[2 * i] = c; d[2 * i + 1] = c; }
+        copy32(d + fb_stride, d, (u32)(x1 - x0) * 2);
+    }
 }
 static void outline_draw(void) {
     if (!ol_on) return;
@@ -329,11 +389,11 @@ static void outline_draw(void) {
         int x = ol_x + k, y = ol_y + k, w = ol_w - 2 * k, h = ol_h - 2 * k;
         for (int i = 0; i < w; i++) for (int e = 0; e < 2; e++) {
             int px = x + i, py = e ? y + h - 1 : y;
-            if (px >= 0 && px < W && py >= 0 && py < H && ((px + py) & 1)) fb[py * fb_stride + px] = bb[py * MAXW + px] ^ 0xFFFFFF;
+            if (px >= 0 && px < W && py >= 0 && py < H && ((px + py) & 1)) fbpx(px, py, bb[py * BW + px] ^ 0xFFFFFF);
         }
         for (int j = 0; j < h; j++) for (int e = 0; e < 2; e++) {
             int py = y + j, px = e ? x + w - 1 : x;
-            if (px >= 0 && px < W && py >= 0 && py < H && ((px + py) & 1)) fb[py * fb_stride + px] = bb[py * MAXW + px] ^ 0xFFFFFF;
+            if (px >= 0 && px < W && py >= 0 && py < H && ((px + py) & 1)) fbpx(px, py, bb[py * BW + px] ^ 0xFFFFFF);
         }
     }
 }
@@ -347,11 +407,11 @@ static void cursor_draw(void) {
         char c = CURSOR[j][i];
         int x = cur_x + i, y = cur_y + j;
         if (x >= W || y >= H) continue;
-        if (c == 'D') fb[y * fb_stride + x] = 0x0B0E18;
-        else if (c == 'W') fb[y * fb_stride + x] = 0xFFFFFF;
-        else if (c == 'P') fb[y * fb_stride + x] = mix(0x2DD4BF, 0x8B5CF6, j, CUR_H);
+        if (c == 'D') fbpx(x, y, 0x0B0E18);
+        else if (c == 'W') fbpx(x, y, 0xFFFFFF);
+        else if (c == 'P') fbpx(x, y, mix(0x2DD4BF, 0x8B5CF6, j, CUR_H));
         else if (x > cur_x + 1 && y > cur_y + 2 && CURSOR[j - 2][i - 2] != '.')   /* soft shadow */
-            fb[y * fb_stride + x] = blend(bb[y * MAXW + x], 0, 80);
+            fbpx(x, y, blend(bb[y * BW + x], 0, 80));
     }
 }
 static void present(int x, int y, int w, int h) {
@@ -480,14 +540,19 @@ static void ata_init(void) {
  *  PCI scan: list storage and USB controllers so the System app can show
  *  what hardware is there (read-only, nothing is changed).
  * ==================================================================== */
-struct PciDev { u16 vendor, device; u8 cls, sub, prog; };
-static struct PciDev pci_store[12]; static int npci;
+struct PciDev { u16 vendor, device; u8 cls, sub, prog; u8 bus, dev, fn; };
+static struct PciDev pci_store[16]; static int npci;
+static int pci_total;                      /* all PCI functions found */
 static u32 pci_read(u32 bus, u32 dev, u32 fn, u32 reg) {
     outl_(0xCF8, 0x80000000u | bus << 16 | dev << 11 | fn << 8 | (reg & 0xFC));
     return inl_(0xCFC);
 }
+static void pci_write(u32 bus, u32 dev, u32 fn, u32 reg, u32 v) {
+    outl_(0xCF8, 0x80000000u | bus << 16 | dev << 11 | fn << 8 | (reg & 0xFC));
+    outl_(0xCFC, v);
+}
 static void pci_scan(void) {
-    npci = 0;
+    npci = 0; pci_total = 0;
     for (u32 bus = 0; bus < 256; bus++)
         for (u32 dev = 0; dev < 32; dev++) {
             u32 v = pci_read(bus, dev, 0, 0);
@@ -498,8 +563,9 @@ static void pci_scan(void) {
                 if ((id & 0xFFFF) == 0xFFFF) continue;
                 u32 cl = pci_read(bus, dev, fn, 0x08);
                 u8 cls = (u8)(cl >> 24), sub = (u8)(cl >> 16), prog = (u8)(cl >> 8);
-                if ((cls == 0x01 || (cls == 0x0C && sub == 0x03)) && npci < 12)
-                    pci_store[npci++] = (struct PciDev){(u16)id, (u16)(id >> 16), cls, sub, prog};
+                pci_total++;
+                if ((cls == 0x01 || (cls == 0x0C && sub == 0x03)) && npci < 16)
+                    pci_store[npci++] = (struct PciDev){(u16)id, (u16)(id >> 16), cls, sub, prog, (u8)bus, (u8)dev, (u8)fn};
             }
         }
 }
@@ -509,7 +575,8 @@ static const char *pci_vendor(u16 v) {
     case 0x15B7: return "Western Digital"; case 0x1987: return "Phison"; case 0x1E0F: return "KIOXIA";
     case 0x126F: return "Silicon Motion"; case 0x1C5C: return "SK hynix"; case 0x1B4B: return "Marvell";
     case 0x1106: return "VIA"; case 0x1B21: return "ASMedia"; case 0x1AF4: return "VirtIO"; case 0x80EE: return "VirtualBox";
-    case 0x1234: return "QEMU"; case 0x1D97: return "Shenzhen Longsys"; case 0x2646: return "Kingston"; case 0xC0A9: return "Micron/Crucial";
+    case 0x1234: return "QEMU"; case 0x1B36: return "Red Hat (QEMU)"; case 0x1912: return "Renesas";
+    case 0x1B73: return "Fresco Logic"; case 0x104C: return "Texas Instruments"; case 0x1B6F: return "Etron"; case 0x1D97: return "Shenzhen Longsys"; case 0x2646: return "Kingston"; case 0xC0A9: return "Micron/Crucial";
     }
     return "Unknown maker";
 }
@@ -670,7 +737,7 @@ enum { VAULT_LIVE, VAULT_DISK };
 static int vault_mode = VAULT_LIVE, vault_drive = -1;
 #define RSLOTS 24
 #define RSLOT_SIZE (160 * 1024)
-static u8 ram_pool[RSLOTS][RSLOT_SIZE];
+static u8 (*ram_pool)[RSLOT_SIZE];          /* RSLOTS slots, allocated at boot */
 static struct { bool used; u8 n83[11]; u32 size; } rfiles[RSLOTS];
 static void vault_mount(void) {
     vault_mode = VAULT_LIVE; vault_drive = -1; fs.ok = false;
@@ -720,6 +787,431 @@ static void vault_delete(int ent) {
 }
 
 /* ====================================================================
+ *  ACPI: the firmware's tables that say how to switch the PC off and restart it.
+ *  We only read them (and write the "sleep" register when you press Shut Down).
+ * ==================================================================== */
+static u8 acpi_rsdp[36];             /* copy of the RSDP from the boot loader */
+static bool acpi_ok;                 /* found a usable FADT */
+static u32 acpi_pm1a, acpi_pm1b, acpi_smi; static u8 acpi_enable_val;
+static u16 acpi_slp_a, acpi_slp_b; static bool acpi_s5;
+static u8 acpi_reset_space, acpi_reset_val; static u32 acpi_reset_addr; static bool acpi_reset_ok;
+static char acpi_oem[7] = "";
+static int acpi_rev;
+
+static bool acpi_sum_ok(const u8 *p, u32 n) { u8 s = 0; for (u32 i = 0; i < n; i++) s += p[i]; return s == 0; }
+
+static void acpi_parse_dsdt(const u8 *d) {
+    u32 len = rd32(d + 4);
+    if (len < 36 || len > 0x400000) return;
+    for (u32 i = 36; i + 12 < len; i++) {
+        if (d[i] != '_' || d[i + 1] != 'S' || d[i + 2] != '5' || d[i + 3] != '_') continue;
+        if (!(d[i - 1] == 0x08 || (d[i - 2] == 0x08 && d[i - 1] == '\\'))) continue;   /* Name(_S5_, ...) */
+        const u8 *p = d + i + 4;
+        if (*p != 0x12) continue;                     /* Package */
+        p++;
+        p += ((*p & 0xC0) >> 6) + 2;                 /* skip PkgLength + NumElements */
+        if (*p == 0x0A) p++;                         /* BytePrefix */
+        acpi_slp_a = (u16)((*p & 7) << 10); p++;
+        if (*p == 0x0A) p++;
+        acpi_slp_b = (u16)((*p & 7) << 10);
+        acpi_s5 = true;
+        return;
+    }
+}
+
+static void acpi_init(void) {
+    if (memcmp(acpi_rsdp, "RSD PTR ", 8)) return;
+    for (int i = 0; i < 6; i++) acpi_oem[i] = (char)acpi_rsdp[9 + i];
+    acpi_rev = acpi_rsdp[15];
+    u32 rsdt = rd32(acpi_rsdp + 16);
+    if (!rsdt || !acpi_sum_ok((const u8 *)rsdt, rd32((const u8 *)rsdt + 4))) return;
+    const u8 *r = (const u8 *)rsdt;
+    u32 n = (rd32(r + 4) - 36) / 4;
+    const u8 *fadt = 0;
+    for (u32 i = 0; i < n && i < 64; i++) {
+        const u8 *t = (const u8 *)rd32(r + 36 + i * 4);
+        if (t && !memcmp(t, "FACP", 4)) { fadt = t; break; }
+    }
+    if (!fadt) return;
+    u32 flen = rd32(fadt + 4);
+    acpi_smi = rd32(fadt + 48); acpi_enable_val = fadt[52];
+    acpi_pm1a = rd32(fadt + 64); acpi_pm1b = rd32(fadt + 68);
+    if (flen >= 129 && (rd32(fadt + 112) & (1u << 10))) {   /* RESET_REG_SUP */
+        acpi_reset_space = fadt[116];
+        acpi_reset_addr = rd32(fadt + 120);
+        acpi_reset_val = fadt[128];
+        acpi_reset_ok = acpi_reset_addr && rd32(fadt + 124) == 0;
+    }
+    u32 dsdt = rd32(fadt + 40);
+    if (flen >= 148 && rd32(fadt + 144) == 0 && rd32(fadt + 140)) dsdt = rd32(fadt + 140);
+    if (dsdt && !memcmp((const u8 *)dsdt, "DSDT", 4)) acpi_parse_dsdt((const u8 *)dsdt);
+    acpi_ok = acpi_pm1a != 0;
+}
+
+static void acpi_poweroff(void) {
+    if (!acpi_ok || !acpi_s5) return;
+    if (acpi_smi && acpi_enable_val && !(inw_(acpi_pm1a) & 1)) {   /* switch the chipset into ACPI mode */
+        outb((u16)acpi_smi, acpi_enable_val);
+        for (int i = 0; i < 300 && !(inw_(acpi_pm1a) & 1); i++) sleep_ms(10);
+    }
+    outw((u16)acpi_pm1a, acpi_slp_a | (1 << 13));
+    if (acpi_pm1b) outw((u16)acpi_pm1b, acpi_slp_b | (1 << 13));
+    sleep_ms(500);
+}
+
+static void acpi_reset(void) {
+    if (acpi_reset_ok) {
+        if (acpi_reset_space == 1) outb((u16)acpi_reset_addr, acpi_reset_val);
+        else if (acpi_reset_space == 0) *(volatile u8 *)acpi_reset_addr = acpi_reset_val;
+        sleep_ms(300);
+    }
+    outb(0xCF9, 0x02); sleep_ms(5); outb(0xCF9, 0x06);           /* PCI reset control */
+    sleep_ms(300);
+}
+
+/* ====================================================================
+ *  USB 3 (xHCI) driver: lets USB keyboards and mice work, also on UEFI PCs
+ *  where the old PS/2 emulation is gone. Devices plugged straight into the
+ *  PC's ports are supported (not yet devices behind a USB hub).
+ *
+ *  The controller talks to us through "rings" of 16-byte TRBs in memory:
+ *   - the command ring (we ask the controller to do things),
+ *   - the event ring (it tells us what happened),
+ *   - one transfer ring per endpoint (data to/from a device).
+ *  We poll the event ring from the main loop, no interrupts needed.
+ *  Keyboard and mouse reports are turned into the same PS/2 bytes the rest
+ *  of FacetOS already understands.
+ * ==================================================================== */
+#define XHCI_MAX 2
+#define USB_MAXDEV 8
+#define RING_TRBS 256
+
+struct Trb { u32 p0, p1, st, ctl; };
+struct Ring { struct Trb *t; u32 idx; u32 cycle; };
+
+struct UsbDev {
+    int hc, slot, port, speed;
+    u16 vid, pid; u8 cls;            /* cls: 1 = keyboard, 2 = mouse, 0 = other */
+    char name[40];
+    u8 *in_ctx, *out_ctx;
+    struct Ring ep0;
+    struct Ring intr; int intr_dci, intr_mps; u8 *intr_buf;
+    u8 last_kbd[8];
+    int iface, cfg;
+};
+struct Xhci {
+    u32 base, op, rt, db;
+    int max_slots, max_ports, csz;
+    u64 *dcbaa;
+    struct Ring cmd;
+    struct Trb *evt; u32 evt_idx, evt_cycle;
+    volatile int cc_done; u32 cc_code, cc_slot;            /* last command completion */
+    volatile int tx_done; u32 tx_code, tx_len_left, tx_slot, tx_ep;  /* last EP0 transfer */
+    u16 vid, did;
+};
+static struct Xhci xhc[XHCI_MAX]; static int nxhc;
+static struct UsbDev usbdev[USB_MAXDEV]; static int nusb;
+static bool usb_off;                 /* Safe mode: leave USB alone */
+static int usb_ports_total;
+
+static void *zalloc(u32 n) { void *p = kalloc(n); if (p) memset(p, 0, (n + 4095) & ~4095u); return p; }
+
+static void ring_init(struct Ring *r) {
+    r->t = zalloc(RING_TRBS * 16); r->idx = 0; r->cycle = 1;
+    struct Trb *l = &r->t[RING_TRBS - 1];               /* last TRB links back to the start */
+    l->p0 = (u32)r->t; l->p1 = 0; l->st = 0; l->ctl = (6 << 10) | 2;   /* Link + Toggle Cycle */
+}
+static struct Trb *ring_push(struct Ring *r, u32 p0, u32 p1, u32 st, u32 ctl) {
+    struct Trb *t = &r->t[r->idx];
+    t->p0 = p0; t->p1 = p1; t->st = st;
+    __asm__ volatile("" ::: "memory");
+    t->ctl = (ctl & ~1u) | r->cycle;
+    if (++r->idx == RING_TRBS - 1) {                   /* reached the link TRB: hand it over and wrap */
+        struct Trb *l = &r->t[RING_TRBS - 1];
+        l->ctl = (l->ctl & ~1u) | r->cycle;
+        r->idx = 0; r->cycle ^= 1;
+    }
+    return t;
+}
+
+static void usb_kbd_report(struct UsbDev *d, const u8 *r, int n);
+static void usb_mouse_report(const u8 *r, int n);
+
+/* read everything the controller has put on the event ring */
+static void xhci_events(struct Xhci *x) {
+    for (;;) {
+        struct Trb *e = &x->evt[x->evt_idx];
+        if ((e->ctl & 1) != x->evt_cycle) break;
+        u32 type = (e->ctl >> 10) & 63, code = e->st >> 24, slot = e->ctl >> 24;
+        if (type == 33) { x->cc_code = code; x->cc_slot = slot; x->cc_done = 1; }
+        else if (type == 32) {
+            u32 ep = (e->ctl >> 16) & 31;
+            if (ep == 1) { x->tx_code = code; x->tx_len_left = e->st & 0xFFFFFF; x->tx_slot = slot; x->tx_ep = ep; x->tx_done = 1; }
+            else for (int i = 0; i < nusb; i++) {
+                struct UsbDev *d = &usbdev[i];
+                if (&xhc[d->hc] != x || d->slot != (int)slot || d->intr_dci != (int)ep) continue;
+                if (code == 1 || code == 13) {
+                    int got = d->intr_mps - (int)(e->st & 0xFFFFFF);
+                    if (d->cls == 1) usb_kbd_report(d, d->intr_buf, got);
+                    else if (d->cls == 2) usb_mouse_report(d->intr_buf, got);
+                }
+                /* ask for the next report */
+                ring_push(&d->intr, (u32)d->intr_buf, 0, (u32)d->intr_mps, (1 << 10) | (1 << 5) | (1 << 2));
+                mmio_w32(x->db + 4 * (u32)d->slot, (u32)d->intr_dci);
+            }
+        }
+        if (++x->evt_idx == RING_TRBS) { x->evt_idx = 0; x->evt_cycle ^= 1; }
+        mmio_w64(x->rt + 0x20 + 0x18, (u64)(u32)&x->evt[x->evt_idx] | 8);   /* ERDP, clear busy */
+    }
+}
+
+static bool xhci_cmd(struct Xhci *x, u32 p0, u32 p1, u32 st, u32 ctl) {
+    x->cc_done = 0;
+    ring_push(&x->cmd, p0, p1, st, ctl);
+    mmio_w32(x->db, 0);
+    for (u32 t0 = ms_now; ms_now - t0 < 1000;) { xhci_events(x); if (x->cc_done) return x->cc_code == 1; __asm__ volatile("pause"); }
+    return false;
+}
+
+/* a control transfer on endpoint 0 (setup, optional data, status) */
+static int usb_control(struct UsbDev *d, u8 rt, u8 req, u16 val, u16 idx, u16 len, void *buf) {
+    struct Xhci *x = &xhc[d->hc];
+    u32 s0 = (u32)rt | (u32)req << 8 | (u32)val << 16, s1 = (u32)idx | (u32)len << 16;
+    u32 trt = len ? ((rt & 0x80) ? 3 : 2) : 0;
+    x->tx_done = 0;
+    ring_push(&d->ep0, s0, s1, 8, (2 << 10) | (1 << 6) | (trt << 16));
+    if (len) ring_push(&d->ep0, (u32)buf, 0, len, (3 << 10) | ((rt & 0x80) ? (1u << 16) : 0));
+    ring_push(&d->ep0, 0, 0, 0, (4 << 10) | (1 << 5) | ((len && (rt & 0x80)) ? 0 : (1u << 16)));
+    mmio_w32(x->db + 4 * (u32)d->slot, 1);
+    for (u32 t0 = ms_now; ms_now - t0 < 500;) {
+        xhci_events(x);
+        if (x->tx_done && x->tx_slot == (u32)d->slot) return (x->tx_code == 1 || x->tx_code == 13) ? 0 : -1;
+        __asm__ volatile("pause");
+    }
+    return -1;
+}
+
+static void usb_string(struct UsbDev *d, u8 index, char *out, int max) {
+    static u8 b[256];
+    out[0] = 0;
+    if (!index) return;
+    if (usb_control(d, 0x80, 6, (u16)(0x0300 | index), 0x0409, 255, b) < 0 || b[1] != 3) return;
+    int n = 0;
+    for (int i = 2; i + 1 < b[0] && n < max - 1; i += 2) { u8 c = b[i]; out[n++] = (c >= 32 && c < 127 && !b[i + 1]) ? (char)c : '?'; }
+    while (n && out[n - 1] == ' ') n--;
+    out[n] = 0;
+}
+
+static u8 *ctx(struct Xhci *x, u8 *base, int i) { return base + i * x->csz; }
+
+static void usb_setup_device(int hc, int port, int speed) {
+    struct Xhci *x = &xhc[hc];
+    if (nusb >= USB_MAXDEV) return;
+    if (!xhci_cmd(x, 0, 0, 0, 9 << 10)) { return; }   /* Enable Slot */
+    int slot = (int)x->cc_slot;
+    struct UsbDev *d = &usbdev[nusb];
+    memset(d, 0, sizeof *d);
+    d->hc = hc; d->slot = slot; d->port = port; d->speed = speed;
+    d->in_ctx = zalloc(4096); d->out_ctx = zalloc(4096);
+    ring_init(&d->ep0);
+    x->dcbaa[slot] = (u32)d->out_ctx;
+    int mps = speed == 4 ? 512 : speed == 3 ? 64 : 8;
+    u32 *icc = (u32 *)ctx(x, d->in_ctx, 0), *sl = (u32 *)ctx(x, d->in_ctx, 1), *e0 = (u32 *)ctx(x, d->in_ctx, 2);
+    icc[1] = 3;                                                          /* add slot + EP0 */
+    sl[0] = ((u32)speed << 20) | (1u << 27); sl[1] = (u32)port << 16;
+    e0[1] = (3 << 1) | (4 << 3) | ((u32)mps << 16);                     /* control endpoint */
+    e0[2] = (u32)d->ep0.t | 1; e0[3] = 0; e0[4] = 8;
+    if (!xhci_cmd(x, (u32)d->in_ctx, 0, 0, (11u << 10) | ((u32)slot << 24))) { return; }   /* Address Device */
+    sleep_ms(10);
+    static u8 dd[18];
+    if (usb_control(d, 0x80, 6, 0x0100, 0, 8, dd) < 0) { return; }
+    if (dd[7] && dd[7] != mps) {                                         /* fix EP0 packet size */
+        mps = dd[7];
+        memset(d->in_ctx, 0, 4096);
+        icc[1] = 2; e0[1] = (3 << 1) | (4 << 3) | ((u32)mps << 16); e0[2] = (u32)d->ep0.t | d->ep0.cycle; e0[4] = 8;
+        xhci_cmd(x, (u32)d->in_ctx, 0, 0, (13u << 10) | ((u32)slot << 24));   /* Evaluate Context */
+    }
+    if (usb_control(d, 0x80, 6, 0x0100, 0, 18, dd) < 0) return;
+    d->vid = (u16)(dd[8] | dd[9] << 8); d->pid = (u16)(dd[10] | dd[11] << 8);
+    usb_string(d, dd[15], d->name, sizeof d->name);
+    if (!d->name[0]) usb_string(d, dd[14], d->name, sizeof d->name);
+    static u8 cf[512];
+    if (usb_control(d, 0x80, 6, 0x0200, 0, 9, cf) < 0) { nusb++; return; }
+    int tot = imin(cf[2] | cf[3] << 8, 512);
+    if (usb_control(d, 0x80, 6, 0x0200, 0, (u16)tot, cf) < 0) { nusb++; return; }
+    d->cfg = cf[5];
+    /* find a HID boot keyboard / mouse interface and its interrupt-IN endpoint */
+    int cur_iface = -1, cur_proto = 0, ep_addr = 0, ep_mps = 8, ep_int = 10;
+    for (int i = 0; i + 2 <= tot && cf[i]; i += cf[i]) {
+        if (cf[i + 1] == 4) {
+            cur_iface = -1;
+            if (cf[i + 5] == 3 && cf[i + 6] == 1 && (cf[i + 7] == 1 || cf[i + 7] == 2) && !d->cls) { cur_iface = cf[i + 2]; cur_proto = cf[i + 7]; }
+        } else if (cf[i + 1] == 5 && cur_iface >= 0 && !d->cls && (cf[i + 2] & 0x80) && (cf[i + 3] & 3) == 3) {
+            ep_addr = cf[i + 2] & 15; ep_mps = (cf[i + 4] | cf[i + 5] << 8) & 0x7FF; ep_int = cf[i + 6];
+            d->cls = (u8)cur_proto; d->iface = cur_iface;
+        }
+    }
+    nusb++;
+    usb_control(d, 0x00, 9, (u16)d->cfg, 0, 0, 0);                        /* Set Configuration */
+    if (!d->cls) return;
+    usb_control(d, 0x21, 0x0B, 0, (u16)d->iface, 0, 0);                   /* Set Protocol: boot */
+    if (d->cls == 1) usb_control(d, 0x21, 0x0A, 0, (u16)d->iface, 0, 0);  /* Set Idle */
+    /* Configure Endpoint for the interrupt-IN endpoint */
+    int dci = ep_addr * 2 + 1;
+    d->intr_dci = dci; d->intr_mps = imin(ep_mps, 64);
+    d->intr_buf = zalloc(4096);
+    ring_init(&d->intr);
+    memset(d->in_ctx, 0, 4096);
+    icc[1] = 1u | (1u << dci);
+    memcpy(sl, ctx(x, d->out_ctx, 0), 32);
+    sl[0] = (sl[0] & ~(31u << 27)) | ((u32)dci << 27);
+    u32 *ep = (u32 *)ctx(x, d->in_ctx, dci + 1);
+    int iv;                                                              /* interval as 2^iv x 125 us */
+    if (speed >= 3) iv = imax(0, imin(15, ep_int - 1));
+    else { iv = 3; while (iv < 10 && (1 << (iv - 3)) < ep_int) iv++; }
+    ep[0] = (u32)iv << 16;
+    ep[1] = (3 << 1) | (7 << 3) | ((u32)ep_mps << 16);                   /* Interrupt IN */
+    ep[2] = (u32)d->intr.t | 1; ep[3] = 0; ep[4] = (u32)ep_mps | ((u32)ep_mps << 16);
+    if (!xhci_cmd(x, (u32)d->in_ctx, 0, 0, (12u << 10) | ((u32)slot << 24))) { d->cls = 0; return; }
+    for (int i = 0; i < 1; i++) ring_push(&d->intr, (u32)d->intr_buf, 0, (u32)d->intr_mps, (1 << 10) | (1 << 5) | (1 << 2));
+    mmio_w32(x->db + 4 * (u32)slot, (u32)dci);
+}
+
+static void xhci_init_one(struct PciDev *pd) {
+    if (nxhc >= XHCI_MAX) return;
+    u32 bar = pci_read(pd->bus, pd->dev, pd->fn, 0x10);
+    if (bar & 1) return;
+    u64 phys = bar & ~15u;
+    if (((bar >> 1) & 3) == 2) phys |= (u64)pci_read(pd->bus, pd->dev, pd->fn, 0x14) << 32;   /* 64-bit BAR */
+    u32 mapped = map_phys(phys, 0x10000);
+    if (!mapped) return;
+    u32 cmdr = pci_read(pd->bus, pd->dev, pd->fn, 0x04);
+    pci_write(pd->bus, pd->dev, pd->fn, 0x04, (cmdr & 0xFFFF) | 6);                  /* memory + bus master */
+    struct Xhci *x = &xhc[nxhc];
+    memset(x, 0, sizeof *x);
+    x->vid = pd->vendor; x->did = pd->device;
+    x->base = mapped;
+    u32 cap = mmio_r32(x->base);
+    x->op = x->base + (cap & 0xFF);
+    u32 hcs1 = mmio_r32(x->base + 4), hcs2 = mmio_r32(x->base + 8), hcc1 = mmio_r32(x->base + 0x10);
+    x->rt = x->base + (mmio_r32(x->base + 0x18) & ~31u);
+    x->db = x->base + (mmio_r32(x->base + 0x14) & ~3u);
+    x->max_slots = imin((int)(hcs1 & 0xFF), 32); x->max_ports = (int)(hcs1 >> 24);
+    x->csz = (hcc1 & 4) ? 64 : 32;
+    /* take the controller over from the firmware (BIOS/UEFI handoff) */
+    for (u32 off = (hcc1 >> 16) * 4, n = 0; off && n < 64; n++) {
+        u32 a = x->base + off, v = mmio_r32(a);
+        if ((v & 0xFF) == 1) {
+            mmio_w32(a, v | (1u << 24));
+            for (u32 t0 = ms_now; (mmio_r32(a) & (1u << 16)) && ms_now - t0 < 1000;) ;
+            mmio_w32(a, mmio_r32(a) & ~(1u << 16));
+            mmio_w32(a + 4, (mmio_r32(a + 4) & ~0xE01Fu) | 0xE0000000u);
+        }
+        u32 nx = (v >> 8) & 0xFF;
+        if (!nx) break;
+        off += nx * 4;
+    }
+    /* stop and reset */
+    mmio_w32(x->op, mmio_r32(x->op) & ~1u);
+    for (u32 t0 = ms_now; !(mmio_r32(x->op + 4) & 1) && ms_now - t0 < 200;) ;
+    mmio_w32(x->op, 2);
+    for (u32 t0 = ms_now; (mmio_r32(x->op) & 2) && ms_now - t0 < 1000;) ;
+    for (u32 t0 = ms_now; (mmio_r32(x->op + 4) & (1u << 11)) && ms_now - t0 < 1000;) ;
+    if (mmio_r32(x->op + 4) & (1u << 11)) return;
+    mmio_w32(x->op + 0x38, (u32)x->max_slots);
+    x->dcbaa = zalloc(4096);
+    int nsp = (int)(((hcs2 >> 27) & 31) | ((hcs2 >> 16) & 0x3E0));
+    if (nsp) {
+        u64 *spa = zalloc(4096);
+        for (int i = 0; i < nsp && i < 512; i++) spa[i] = (u32)zalloc(4096);
+        x->dcbaa[0] = (u32)spa;
+    }
+    mmio_w64(x->op + 0x30, (u32)x->dcbaa);
+    ring_init(&x->cmd);
+    mmio_w64(x->op + 0x18, (u32)x->cmd.t | 1);
+    x->evt = zalloc(RING_TRBS * 16); x->evt_idx = 0; x->evt_cycle = 1;
+    u32 *erst = zalloc(4096);
+    erst[0] = (u32)x->evt; erst[1] = 0; erst[2] = RING_TRBS; erst[3] = 0;
+    u32 ir = x->rt + 0x20;
+    mmio_w32(ir + 0x08, 1);
+    mmio_w64(ir + 0x18, (u32)x->evt);
+    mmio_w64(ir + 0x10, (u32)erst);
+    mmio_w32(ir, mmio_r32(ir) | 2);
+    mmio_w32(x->op, 1);                                                  /* run */
+    for (u32 t0 = ms_now; (mmio_r32(x->op + 4) & 1) && ms_now - t0 < 500;) ;
+    int hc = nxhc++;
+    usb_ports_total += x->max_ports;
+    sleep_ms(50);
+    /* reset every port that has something plugged in, then set the device up */
+    for (int p = 1; p <= x->max_ports; p++) {
+        u32 pa = x->op + 0x400 + 0x10 * (u32)(p - 1), ps = mmio_r32(pa);
+        if (!(ps & 1)) continue;
+        if (!(ps & 2)) {
+            mmio_w32(pa, (ps & ~((1u << 1) | (0x7Fu << 17))) | (1u << 4) | (1u << 9));
+            for (u32 t0 = ms_now; ms_now - t0 < 300;) { ps = mmio_r32(pa); if (ps & (1u << 21)) break; }
+        }
+        ps = mmio_r32(pa);
+        mmio_w32(pa, (ps & ~((1u << 1) | (0x7Fu << 17))) | (0x7Fu << 17));  /* clear change bits */
+        ps = mmio_r32(pa);
+        if (!(ps & 2)) continue;
+        sleep_ms(20);
+        usb_setup_device(hc, p, (int)((ps >> 10) & 15));
+    }
+}
+
+static void usb_init(void) {
+    if (usb_off) return;
+    for (int i = 0; i < npci; i++)
+        if (pci_store[i].cls == 0x0C && pci_store[i].sub == 0x03 && pci_store[i].prog == 0x30) xhci_init_one(&pci_store[i]);
+}
+static void usb_poll(void) { for (int i = 0; i < nxhc; i++) xhci_events(&xhc[i]); }
+
+/* ---- turn USB reports into the PS/2 bytes the desktop already understands ---- */
+static void ev_push_safe(u16 v) { cli(); ev_push(v); sti(); }
+/* HID usage -> PS/2 set 1 scancode (0x100 = needs the E0 prefix) */
+static const u16 HID2SC[0x65] = {
+    0, 0, 0, 0, 0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26,
+    0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x1C, 0x01, 0x0E, 0x0F, 0x39, 0x0C, 0x0D, 0x1A,
+    0x1B, 0x2B, 0x2B, 0x27, 0x28, 0x29, 0x33, 0x34, 0x35, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40,
+    0x41, 0x42, 0x43, 0x44, 0x57, 0x58, 0, 0x46, 0, 0x152, 0x147, 0x149, 0x153, 0x14F, 0x151, 0x14D,
+    0x14B, 0x150, 0x148, 0x45, 0x135, 0x37, 0x4A, 0x4E, 0x11C, 0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47,
+    0x48, 0x49, 0x52, 0x53, 0x56,
+};
+static const u16 MOD2SC[8] = {0x1D, 0x2A, 0x38, 0x15B, 0x11D, 0x36, 0x138, 0x15C};
+static void sc_emit(u16 sc, bool up) {
+    if (!sc) return;
+    if (sc & 0x100) ev_push_safe(0xE0);
+    ev_push_safe((u16)((sc & 0xFF) | (up ? 0x80 : 0)));
+}
+static void usb_kbd_report(struct UsbDev *d, const u8 *r, int n) {
+    if (n < 8 || r[2] == 1) return;                     /* too short / roll-over error */
+    u8 *o = d->last_kbd;
+    for (int b = 0; b < 8; b++)
+        if (((r[0] ^ o[0]) >> b) & 1) sc_emit(MOD2SC[b], !((r[0] >> b) & 1));
+    for (int i = 2; i < 8; i++) {                       /* released keys */
+        if (!o[i]) continue;
+        bool still = false;
+        for (int j = 2; j < 8; j++) if (r[j] == o[i]) still = true;
+        if (!still && o[i] < 0x65) sc_emit(HID2SC[o[i]], true);
+    }
+    for (int i = 2; i < 8; i++) {                       /* newly pressed keys */
+        if (!r[i]) continue;
+        bool was = false;
+        for (int j = 2; j < 8; j++) if (o[j] == r[i]) was = true;
+        if (!was && r[i] < 0x65) sc_emit(HID2SC[r[i]], false);
+    }
+    memcpy(o, r, 8);
+}
+static void usb_mouse_report(const u8 *r, int n) {
+    if (n < 3) return;
+    int dx = (signed char)r[1], dy = -(signed char)r[2];
+    u8 b0 = (u8)(0x08 | (r[0] & 7) | (dx < 0 ? 0x10 : 0) | (dy < 0 ? 0x20 : 0));
+    ev_push_safe(0x100 | b0); ev_push_safe((u16)(0x100 | (dx & 0xFF))); ev_push_safe((u16)(0x100 | (dy & 0xFF)));
+}
+static const char *usb_speed_name(int s) { return s == 1 ? "12 Mb/s" : s == 2 ? "1.5 Mb/s" : s == 3 ? "480 Mb/s" : s >= 4 ? "5 Gb/s" : "?"; }
+
+/* ====================================================================
  *  Wallpapers (computed pixel by pixel): low-poly facets + soft light beams
  * ==================================================================== */
 struct Theme { const char *name; u32 top, bottom, beam1, beam2; int facet, beam_strength; };
@@ -757,7 +1249,7 @@ static void make_wallpaper(void) {
             g += (int)(((t->beam1 >> 8) & 255) * b1 + ((t->beam2 >> 8) & 255) * b2) >> 8;
             b += (int)((t->beam1 & 255) * b1 + (t->beam2 & 255) * b2) >> 8;
             r = imax(0, imin(255, r)); g = imax(0, imin(255, g)); b = imax(0, imin(255, b));
-            bgbuf[y * MAXW + x] = (u32)(r << 16 | g << 8 | b);
+            bgbuf[y * BW + x] = (u32)(r << 16 | g << 8 | b);
         }
     }
 }
@@ -774,7 +1266,7 @@ static void make_wallpaper(void) {
 #define PANEL2 0x1D2436
 #define LINE 0x2C3550
 #define PRISM 0xFF000000u     /* special colour: use the prism gradient */
-static inline void pset_(int x, int y, u32 c) { if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1) bb[y * MAXW + x] = c; }
+static inline void pset_(int x, int y, u32 c) { if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1) bb[y * BW + x] = c; }
 static int slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static bool streq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
 static u32 prism(int t, int n) {                       /* teal -> sky -> indigo -> violet */
@@ -795,7 +1287,7 @@ static u32 cham_cov(int i, int j, int x, int y, int w, int h, int c) {
 static void chamfer(int x, int y, int w, int h, int c, u32 col, u32 alpha) {
     CLIPRECT;
     for (int j = y0; j < y1; j++) {
-        u32 *row = &bb[j * MAXW];
+        u32 *row = &bb[j * BW];
         for (int i = x0; i < x1; i++) {
             u32 a = cham_cov(i, j, x, y, w, h, c) * alpha / 255;
             if (!a) continue;
@@ -840,13 +1332,18 @@ static struct Win win[NWIN];
 static int zord[NWIN], nz;
 static int dsel = -1, fsel = -1;
 static bool launcher_open, anims_on = true;
+static int set_tab;                          /* Settings: which tab is open */
 static int dock_x, dock_y, dock_w;
 
 static int mx, my, mbtn;
+static bool alt, ctrl;
+static char boot_fw[8] = "BIOS";             /* how the PC started us: BIOS or UEFI */
+static bool safe_mode;
 static int drag_win = -1, drag_dx, drag_dy;
 static u32 last_click_ms; static int last_click_x, last_click_y;
 static bool caret_on = true; static u32 caret_ms;
-static u8 filebuf[512 * 1024];
+#define FILEBUF_SIZE (512 * 1024)
+static u8 *filebuf;                         /* allocated at boot */
 static int pressed_btn = -1;                  /* which toolbar button is held down (for feedback) */
 
 /* Notes */
@@ -1088,12 +1585,12 @@ static const char *const README[] = {
     "FacetOS is a tiny operating system that draws every single",
     "pixel on this screen by itself - no Linux, no libraries.",
     "",
-    "New in 1.2: a look of its own. Dark glass windows with cut",
-    "corners, the Prism Bar at the bottom, window animations,",
-    "and a Vault that works like a live USB.",
+    "New in 1.3: it runs on modern PCs. UEFI boot, any screen",
+    "size (big screens are shown at 2x), USB keyboards and mice,",
+    "real power off, and Settings with more to explore.",
     "",
     "  - Click the gem in the Prism Bar to see all apps.",
-    "  - Click an app in the Prism Bar to open or hide it.",
+    "  - Win key: apps.  Alt+Tab: switch.  Alt+F4: close.",
     "  - The Vault keeps your files until you shut down.",
     "  - FacetOS never formats or overwrites your disks.",
     "",
@@ -1118,8 +1615,10 @@ static void draw_content(int id, int x, int y, int w, int h) {
         int yy = y + 116;
         p = utoa(mem_mb, s); scat(p, " MB"); line_kv(x + 20, yy, "Memory", s); yy += 19;
         p = scat(s, cpu_vendor); scat(p, " (32-bit)"); line_kv(x + 20, yy, "Processor", s); yy += 19;
-        p = utoa((u32)W, s); p = scat(p, " x "); p = utoa((u32)H, p); scat(p, ", 32-bit colour"); line_kv(x + 20, yy, "Display", s); yy += 19;
-        line_kv(x + 20, yy, "Started by", loader); yy += 26;
+        p = utoa((u32)PW, s); p = scat(p, " x "); p = utoa((u32)PH, p); scat(p, SCALE == 2 ? ", shown at 2x" : ", 32-bit colour"); line_kv(x + 20, yy, "Display", s); yy += 19;
+        p = scat(s, boot_fw); p = scat(p, " via "); scat(p, loader); line_kv(x + 20, yy, "Started by", s); yy += 19;
+        p = utoa((u32)nusb, s); p = scat(p, nusb == 1 ? " device on " : " devices on "); p = utoa((u32)nxhc, p); scat(p, nxhc == 1 ? " USB 3 controller" : " USB 3 controllers");
+        line_kv(x + 20, yy, "USB", usb_off ? "off (Safe mode)" : s); yy += 26;
         text(&F_BOLD, x + 20, yy, "Storage found", TXT); yy += 20;
         int shown = 0;
         for (int i = 0; i < ndrives && shown < 5; i++, shown++) {
@@ -1203,7 +1702,7 @@ static void draw_content(int id, int x, int y, int w, int h) {
         int ox = x, oy = y + 41;
         int i0 = imax(cx0 - ox, 0), i1 = imin(cx1 - ox, CW), j0 = imax(cy0 - oy, 0), j1 = imin(cy1 - oy, CH);
         for (int j = j0; j < j1; j++) {
-            u32 *row = &bb[(oy + j) * MAXW + ox];
+            u32 *row = &bb[(oy + j) * BW + ox];
             const u8 *src = &canvas[j * CW];
             for (int i = i0; i < i1; i++) row[i] = PCOL[src[i]];
         }
@@ -1247,25 +1746,85 @@ static void draw_content(int id, int x, int y, int w, int h) {
         break; }
     case W_SETTINGS: {
         fill(x, y, w, h, PANEL);
-        text(&F_BOLD, x + 20, y + 16, "Wallpaper", TXT);
+        fill(x, y, w, 44, PANEL2); hline(x, y + 44, w, LINE);
+        static const char *const TABS[4] = {"Appearance", "Display", "System", "Updates"};
         for (int i = 0; i < 4; i++) {
-            int tx = x + 20 + i * 104, ty = y + 42;
-            if (theme == i) chamfer(tx - 3, ty - 3, 98, 70, 10, PRISM, 255);
-            chamfer(tx, ty, 92, 64, 8, THEMES[i].bottom, 255);
-            int sx0 = cx0, sy0 = cy0, sx1 = cx1, sy1 = cy1;
-            cy1 = imin(cy1, ty + 34);
-            chamfer(tx, ty, 92, 64, 8, THEMES[i].top, 255);
-            cx0 = sx0; cy0 = sy0; cx1 = sx1; cy1 = sy1;
-            diamond(tx + 70, ty + 18, 9, THEMES[i].beam1, 150); diamond(tx + 56, ty + 26, 6, THEMES[i].beam2, 150);
-            text_c(&F_REG, tx + 46, ty + 72, THEMES[i].name, theme == i ? TXT : TXT2);
+            int tx = x + 12 + i * 112;
+            if (set_tab == i) chamfer(tx, y + 9, 104, 26, 6, PRISM, 255);
+            else chamfer(tx, y + 9, 104, 26, 6, 0x262E47, 255);
+            text_c(&F_BOLD, tx + 52, y + 15, TABS[i], set_tab == i ? 0xFFFFFF : TXT2);
         }
-        text(&F_BOLD, x + 20, y + 140, "Window animations", TXT);
-        text(&F_REG, x + 20, y + 160, "Shimmer when opening, shatter when closing.", TXT2);
-        int sx = x + w - 76, sy = y + 144;
-        chamfer(sx, sy, 52, 26, 6, anims_on ? PRISM : 0x323B57, 255);
-        diamond(anims_on ? sx + 38 : sx + 14, sy + 13, 9, 0xFFFFFF, 255);
-        hline(x + 20, y + 196, w - 40, LINE);
-        text(&F_REG, x + 20, y + 210, "FacetOS " VERSION " \"Prism\"  -  made with Claude, free and open source.", TXT2);
+        int oy = y + 58;
+        if (set_tab == 0) {
+            text(&F_BOLD, x + 20, oy, "Wallpaper", TXT);
+            for (int i = 0; i < 4; i++) {
+                int tx = x + 20 + i * 104, ty = oy + 26;
+                if (theme == i) chamfer(tx - 3, ty - 3, 98, 70, 10, PRISM, 255);
+                chamfer(tx, ty, 92, 64, 8, THEMES[i].bottom, 255);
+                int sx0 = cx0, sy0 = cy0, sx1 = cx1, sy1 = cy1;
+                cy1 = imin(cy1, ty + 34);
+                chamfer(tx, ty, 92, 64, 8, THEMES[i].top, 255);
+                cx0 = sx0; cy0 = sy0; cx1 = sx1; cy1 = sy1;
+                diamond(tx + 70, ty + 18, 9, THEMES[i].beam1, 150); diamond(tx + 56, ty + 26, 6, THEMES[i].beam2, 150);
+                text_c(&F_REG, tx + 46, ty + 72, THEMES[i].name, theme == i ? TXT : TXT2);
+            }
+            text(&F_BOLD, x + 20, oy + 124, "Window animations", TXT);
+            text(&F_REG, x + 20, oy + 144, "Shimmer when opening, shatter when closing.", TXT2);
+            int sx = x + w - 76, sy = oy + 128;
+            chamfer(sx, sy, 52, 26, 6, anims_on ? PRISM : 0x323B57, 255);
+            diamond(anims_on ? sx + 38 : sx + 14, sy + 13, 9, 0xFFFFFF, 255);
+        } else if (set_tab == 1) {
+            text(&F_BOLD, x + 20, oy, "Screen", TXT); oy += 24;
+            p = utoa((u32)PW, s); p = scat(p, " x "); utoa((u32)PH, p); line_kv(x + 20, oy, "Resolution", s); oy += 19;
+            p = utoa((u32)W, s); p = scat(p, " x "); utoa((u32)H, p); line_kv(x + 20, oy, "Desktop size", s); oy += 30;
+            text(&F_BOLD, x + 20, oy, "Size of everything", TXT);
+            text(&F_REG, x + 20, oy + 20, "Bigger text and icons for large screens.", TXT2);
+            bool can2 = PW / 2 >= 1024 && PH / 2 >= 600;
+            for (int i = 0; i < 2; i++) {
+                int bx = x + w - 150 + i * 66, by = oy + 4;
+                bool on = SCALE == i + 1, dis = i == 1 && !can2;
+                chamfer(bx, by, 58, 28, 6, on ? PRISM : 0x262E47, 255);
+                text_c(&F_BOLD, bx + 29, by + 7, i ? "2x" : "1x", dis ? 0x4A5270 : on ? 0xFFFFFF : TXT2);
+            }
+            if (!can2) text(&F_REG, x + 20, oy + 40, "(2x needs a screen of at least 2048 x 1200.)", 0x5A6380);
+            oy += 70;
+            text(&F_REG, x + 20, oy, "The resolution is chosen when the PC starts. Pick", TXT2);
+            text(&F_REG, x + 20, oy + 18, "\"Safe mode\" in the boot menu for 1024 x 768.", TXT2);
+        } else if (set_tab == 2) {
+            line_kv(x + 20, oy, "Firmware", boot_fw); oy += 19;
+            if (acpi_ok) { p = scat(s, "ACPI "); p = scat(p, acpi_rev >= 2 ? "2.0+" : "1.0"); p = scat(p, "  -  "); p = scat(p, acpi_oem); if (!acpi_s5) scat(p, " (no S5)"); }
+            else scat(s, "not found (power off may not work)");
+            line_kv(x + 20, oy, "Power", s); oy += 19;
+            p = utoa((u32)pci_total, s); scat(p, " PCI devices"); line_kv(x + 20, oy, "Hardware", s); oy += 19;
+            line_kv(x + 20, oy, "Mode", safe_mode ? "Safe mode" : "Normal"); oy += 26;
+            text(&F_BOLD, x + 20, oy, "USB devices", TXT); oy += 20;
+            if (usb_off) { text(&F_REG, x + 38, oy, "USB is switched off in Safe mode.", TXT2); oy += 18; }
+            else if (!nxhc) { text(&F_REG, x + 38, oy, "No USB 3 controller found (PS/2 keyboard and mouse only).", TXT2); oy += 18; }
+            else if (!nusb) { text(&F_REG, x + 38, oy, "Nothing plugged into the USB ports.", TXT2); oy += 18; }
+            for (int i = 0; i < nusb && i < 6; i++) {
+                struct UsbDev *d = &usbdev[i];
+                p = scat(s, d->name[0] ? d->name : "USB device");
+                diamond(x + 26, oy + 8, 4, d->cls ? PRISM : 0x5A6380, 255);
+                text(&F_REG, x + 38, oy, s, TXT);
+                p = scat(s, d->cls == 1 ? "keyboard" : d->cls == 2 ? "mouse" : "not supported yet"); p = scat(p, ", "); scat(p, usb_speed_name(d->speed));
+                text(&F_REG, x + w - 20 - text_w(&F_REG, s), oy, s, TXT2);
+                oy += 18;
+            }
+            text(&F_REG, x + 20, oy + 6, "Devices behind a USB hub are not supported yet.", 0x5A6380);
+        } else {
+            image(&GEM_MED, x + 20, oy, 255, false);
+            text(&F_BOLD, x + 62, oy + 2, "FacetOS " VERSION " \"Prism\"", TXT);
+            text(&F_REG, x + 62, oy + 20, "Installed", 0x5EEAD4);
+            oy += 56;
+            text(&F_REG, x + 20, oy, "Online updates are coming in FacetOS 1.4.", TXT); oy += 20;
+            text(&F_REG, x + 20, oy, "They need internet first: 1.4 adds USB tethering from", TXT2); oy += 18;
+            text(&F_REG, x + 20, oy, "your phone. Every update will be digitally signed, so", TXT2); oy += 18;
+            text(&F_REG, x + 20, oy, "nobody can send your PC a fake one.", TXT2); oy += 30;
+            chamfer(x + 20, oy, 170, 30, 7, 0x262E47, 255);
+            text_c(&F_BOLD, x + 105, oy + 8, "Check for updates", 0x4A5270);
+        }
+        hline(x + 20, y + h - 40, w - 40, LINE);
+        text(&F_REG, x + 20, y + h - 26, "FacetOS " VERSION " \"Prism\"  -  made with Claude, free and open source.", 0x5A6380);
         break; }
     case W_README:
         fill(x, y, w, h, PANEL);
@@ -1422,7 +1981,7 @@ static void draw_desk_icons(void) {
 static void compose(int x, int y, int w, int h) {
     clip_set(x, y, w, h);
     if (cx0 >= cx1 || cy0 >= cy1) return;
-    for (int j = cy0; j < cy1; j++) copy32(&bb[j * MAXW + cx0], &bgbuf[j * MAXW + cx0], (u32)(cx1 - cx0));
+    for (int j = cy0; j < cy1; j++) copy32(&bb[j * BW + cx0], &bgbuf[j * BW + cx0], (u32)(cx1 - cx0));
     if (cx0 < 120) draw_desk_icons();
     int top = top_win();
     for (int i = 0; i < nz; i++) {
@@ -1448,13 +2007,13 @@ static void damage_launcher(void) { int x, y; launcher_rect(&x, &y); damage(x - 
 /* ====================================================================
  *  Window animations
  * ==================================================================== */
-static u32 snap_win[700 * 560], snap_bg[700 * 560];
+static u32 *snap_win, *snap_bg;             /* 700 x 560 each, allocated at boot */
 static void anim_frame_wait(void) { sleep_ms(16); }
 static void snap_take(u32 *dst, int x, int y, int w, int h) {
     for (int j = 0; j < h; j++) {
         int py = y + j;
         if (py < 0 || py >= H) { for (int i = 0; i < w; i++) dst[j * w + i] = 0; continue; }
-        for (int i = 0; i < w; i++) { int px = x + i; dst[j * w + i] = (px >= 0 && px < W) ? bb[py * MAXW + px] : 0; }
+        for (int i = 0; i < w; i++) { int px = x + i; dst[j * w + i] = (px >= 0 && px < W) ? bb[py * BW + px] : 0; }
     }
 }
 static void snap_put(const u32 *src, int x, int y, int w, int h) {
@@ -1462,7 +2021,7 @@ static void snap_put(const u32 *src, int x, int y, int w, int h) {
     if (i1 <= i0) return;
     for (int j = 0; j < h; j++) {
         int py = y + j;
-        if (py >= 0 && py < H) copy32(&bb[py * MAXW + x + i0], &src[j * w + i0], (u32)(i1 - i0));
+        if (py >= 0 && py < H) copy32(&bb[py * BW + x + i0], &src[j * w + i0], (u32)(i1 - i0));
     }
 }
 /* opening: a band of light sweeps across the new window */
@@ -1483,7 +2042,7 @@ static void anim_open(int id) {
                 if (px < 0 || px >= W || py < 0 || py >= H) continue;
                 if (!cham_cov(px, py, x, y, ww, hh, CHAMF)) continue;
                 int d = i - c, a = 80 - iabs(d) * 80 / 26;
-                u32 *p = &bb[py * MAXW + px];
+                u32 *p = &bb[py * BW + px];
                 *p = blend(*p, d < 0 ? 0x5EEAD4 : 0xC4B5FD, (u32)a);
             }
         }
@@ -1523,7 +2082,7 @@ static void anim_close(int id) {
                 for (int b = 0; b < 4; b++) {
                     int qx = px + (b & 1), qy = py + (b >> 1);
                     if (qx < mx0 || qx >= mx0 + bw || qy < my0 || qy >= my0 + bh || qx < 0 || qx >= W || qy < 0 || qy >= H) continue;
-                    u32 *p = &bb[qy * MAXW + qx];
+                    u32 *p = &bb[qy * BW + qx];
                     *p = blend(*p, src, alpha);
                 }
             }
@@ -1622,7 +2181,7 @@ static void save_file(int kind, const char *name) {
     tone(1319); sleep_ms(45); tone(1976); sleep_ms(70); tone(0);
 }
 static void open_file(int i) {
-    u32 sz = vault_read(flist[i].ent, filebuf, sizeof filebuf);
+    u32 sz = vault_read(flist[i].ent, filebuf, FILEBUF_SIZE);
     int n = slen(flist[i].name);
     if (n > 4 && streq(flist[i].name + n - 4, ".TXT")) {
         nlen = 0;
@@ -1671,6 +2230,7 @@ static void dlg_ok(void) {
  * ==================================================================== */
 static void shutdown(void) {
     flush();
+    acpi_poweroff();                                                    /* real PCs */
     outw(0x604, 0x2000); outw(0xB004, 0x2000); outw(0x4004, 0x3400);   /* QEMU, Bochs, VirtualBox */
     clip_all();
     fill_a(0, 0, W, H, 0x000000, 170);
@@ -1684,6 +2244,7 @@ static void shutdown(void) {
     halt();
 }
 static void restart(void) {
+    acpi_reset();
     for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) ;
     outb(0x64, 0xFE);
     struct __attribute__((packed)) { u16 l; u32 b; } z = {0, 0};
@@ -1759,6 +2320,20 @@ static void run_tbtn(int act) {
     case B_SHUFFLE: puzzle_shuffle(); damage_win(W_PUZZLE); break;
     }
 }
+/* switch between normal size and 2x (for big screens) without restarting */
+static void set_scale(int sc) {
+    if (sc == SCALE) return;
+    if (sc == 2 && !(PW / 2 >= 1024 && PH / 2 >= 600)) { beep(); return; }
+    SCALE = sc; W = PW / SCALE; H = PH / SCALE;
+    for (int i = 0; i < NWIN; i++) {
+        win[i].x = imax(0, imin(win[i].x, W - win[i].w));
+        win[i].y = imax(0, imin(win[i].y, H - win[i].h - DOCK_H - 10));
+    }
+    layout_dock(); make_wallpaper();
+    mx = imin(mx, W - 1); my = imin(my, H - 1); cur_x = mx; cur_y = my;
+    clip_all();
+    dmg = false; damage(0, 0, W, H); flush();
+}
 static void content_click(int id, int lx, int ly, bool dbl) {
     for (int i = 0; i < NTBTN; i++) if (TBTNS[i].win == id) {
         int x, y, w, h; tbtn_rect(i, &x, &y, &w, &h);
@@ -1800,10 +2375,15 @@ static void content_click(int id, int lx, int ly, bool dbl) {
                 damage_win(id); break;
             }
     } else if (id == W_SETTINGS) {
-        for (int i = 0; i < 4; i++) if (inside(lx, ly, 20 + i * 104, 42, 92, 84) && theme != i) {
-            theme = i; make_wallpaper(); damage(0, 0, W, H);
+        for (int i = 0; i < 4; i++) if (inside(lx, ly, 12 + i * 112, 9, 104, 26) && set_tab != i) { set_tab = i; damage_win(id); return; }
+        if (set_tab == 0) {
+            for (int i = 0; i < 4; i++) if (inside(lx, ly, 20 + i * 104, 84, 92, 84) && theme != i) {
+                theme = i; make_wallpaper(); damage(0, 0, W, H);
+            }
+            if (inside(lx, ly, cw - 76, 186, 52, 26)) { anims_on = !anims_on; damage_win(id); }
+        } else if (set_tab == 1) {
+            for (int i = 0; i < 2; i++) if (inside(lx, ly, cw - 150 + i * 66, 58 + 24 + 19 + 30 + 4, 58, 28)) set_scale(i + 1);
         }
-        if (inside(lx, ly, cw - 76, 144, 52, 26)) { anims_on = !anims_on; damage_win(id); }
     }
 }
 static void mouse_down(void) {
@@ -1927,7 +2507,31 @@ static void on_key(u8 sc) {
     if (sc == 0x2A || sc == 0x36) { shift = true; return; }
     if (sc == 0xAA || sc == 0xB6) { shift = false; return; }
     if (sc == 0x3A) { caps = !caps; return; }
+    if (sc == 0x38) { alt = true; return; }                      /* Alt / AltGr */
+    if (sc == 0xB8) { alt = false; return; }
+    if (sc == 0x1D) { ctrl = true; return; }
+    if (sc == 0x9D) { ctrl = false; return; }
     if (sc & 0x80) return;
+    /* keyboard shortcuts */
+    if ((was_ext && (sc == 0x5B || sc == 0x5C)) || (ctrl && sc == 0x01)) {   /* Win key or Ctrl+Esc: apps */
+        if (dlg.kind) return;
+        launcher_open = !launcher_open; damage_launcher(); damage_dock();
+        return;
+    }
+    if (alt && sc == 0x0F) {                                     /* Alt+Tab: next window */
+        if (dlg.kind || nz < 1) return;
+        if (launcher_open) { launcher_open = false; damage_launcher(); damage_dock(); }
+        int pick = zord[0];
+        for (int i = 0; i < nz; i++) if (zord[i] != top_win()) { pick = zord[i]; break; }
+        win_open(pick);
+        return;
+    }
+    if (alt && sc == 0x3E) {                                     /* Alt+F4: close the window in front */
+        if (dlg.kind) return;
+        int tw = top_win();
+        if (tw >= 0) win_close(tw);
+        return;
+    }
     char c = 0;
     if (sc == 0x4A) c = '-';
     else if (sc == 0x4E) c = '+';
@@ -1985,14 +2589,14 @@ static void beam_line(int x0, int y0, int x1, int y1, u32 col, int width, u32 al
 }
 static void boot_animation(void) {
     clip_all();
-    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) bgbuf[y * MAXW + x] = mix(0x0E1222, 0x04050A, y, H);
-    memcpy(bb, bgbuf, sizeof(u32) * MAXW * (u32)H);
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) bgbuf[y * BW + x] = mix(0x0E1222, 0x04050A, y, H);
+    memcpy(bb, bgbuf, sizeof(u32) * BW * (u32)H);
     blit(0, 0, W, H);
     int gx = W / 2, gy = H / 2 - 70;
     /* 1. a white beam travels in from the left */
     for (int k = 1; k <= 14; k++) {
         int xe = gx * k / 14;
-        memcpy(&bb[(gy - 20) * MAXW], &bgbuf[(gy - 20) * MAXW], sizeof(u32) * MAXW * 40);
+        memcpy(&bb[(gy - 20) * BW], &bgbuf[(gy - 20) * BW], sizeof(u32) * BW * 40);
         beam_line(0, gy + 10, xe, gy, 0xFFFFFF, 3, 255);
         beam_line(0, gy + 10, xe, gy, 0x9FEFFF, 10, 70);
         blit(0, gy - 20, W, 40);
@@ -2002,7 +2606,7 @@ static void boot_animation(void) {
     static const u32 chime[5] = {1047, 1319, 1568, 2093, 2637};
     static const u32 spec[6] = {0x2DD4BF, 0x38BDF8, 0x3B82F6, 0x6366F1, 0x8B5CF6, 0xEC4899};
     for (int k = 1; k <= 16; k++) {
-        memcpy(bb, bgbuf, sizeof(u32) * MAXW * (u32)H);
+        memcpy(bb, bgbuf, sizeof(u32) * BW * (u32)H);
         beam_line(0, gy + 10, gx, gy, 0xFFFFFF, 3, 255 - (u32)k * 8);
         beam_line(0, gy + 10, gx, gy, 0x9FEFFF, 10, 70);
         int len = (W - gx) * k / 16;
@@ -2023,8 +2627,8 @@ static void boot_animation(void) {
     for (int i = 0; i <= n; i++) {
         if (i == 2) cpu_info();
         if (i == 3) read_clock();
-        if (i == 5) { ata_init(); pci_scan(); vault_mount(); vault_list(); }
-        memcpy(bb, bgbuf, sizeof(u32) * MAXW * (u32)H);
+        if (i == 5) { ata_init(); pci_scan(); usb_init(); vault_mount(); vault_list(); }
+        memcpy(bb, bgbuf, sizeof(u32) * BW * (u32)H);
         if (i < 4) for (int b = 0; b < 6; b++) beam_line(gx, gy, W, gy + (b - 2) * (H / 10) - 30, spec[b], 5, (u32)(200 - i * 50));
         image(&GEM_BIG, gx - 48, gy - 48, 255, false);
         image(&WORDMARK, gx - WORDMARK.w / 2, wy, (u32)imin(255, 60 + i * 50), false);
@@ -2050,7 +2654,7 @@ static void setup_windows(void) {
     win[W_PAINT]    = (struct Win){paint_title, 130, 110, CW + 2, TB + 1 + 41 + CH + CHAMF + 1, false, false};
     win[W_CALC]     = (struct Win){"Calculator", 660, 100, 238, TB + 1 + 302 + CHAMF, false, false};
     win[W_PUZZLE]   = (struct Win){"Puzzle", 600, 250, 204, TB + 1 + 222 + CHAMF, false, false};
-    win[W_SETTINGS] = (struct Win){"Settings", 260, 140, 460, 290, false, false};
+    win[W_SETTINGS] = (struct Win){"Settings", 240, 90, 480, 380, false, false};
     win[W_README]   = (struct Win){"Read Me", 230, 80, 480, 360, false, false};
     win[W_BIN]      = (struct Win){"Bin", W / 2 - 180, 220, 360, 140, false, false};
     const char *hello = "Welcome to FacetOS Prism!\nType here, then press Save.";
@@ -2058,27 +2662,62 @@ static void setup_windows(void) {
     puzzle_shuffle();
 }
 
+static u64 fb_phys;
+static char cmdline[64];
 void kmain(u32 magic, u32 info) {
     if (magic != 0x36d76289) halt();
     u8 *t = (u8 *)info + 8, *end = (u8 *)info + *(u32 *)info;
+    u32 best_base = 0, best_len = 0, kend = ((u32)_kernel_end + 0xFFFFF) & ~0xFFFFFu;
     while (t < end) {
         u32 type = *(u32 *)t, size = *(u32 *)(t + 4);
         if (type == 0) break;
         if (type == 8) {
-            fb = (u32 *)*(u32 *)(t + 8);
+            fb_phys = *(u64 *)(t + 8);
             fb_stride = *(u32 *)(t + 16) / 4;
-            W = (int)*(u32 *)(t + 20); H = (int)*(u32 *)(t + 24);
+            PW = (int)*(u32 *)(t + 20); PH = (int)*(u32 *)(t + 24);
             if (t[28] != 32) halt();
         }
         if (type == 4) mem_mb = (*(u32 *)(t + 12) + 1024) / 1024;
         if (type == 2) { int i = 0; const char *s = (const char *)(t + 8); while (s[i] && i < 47) { loader[i] = s[i]; i++; } loader[i] = 0; }
+        if (type == 1) { int i = 0; const char *s = (const char *)(t + 8); while (s[i] && i < 63) { cmdline[i] = s[i]; i++; } cmdline[i] = 0; }
+        if (type == 11 || type == 12) memcpy(boot_fw, "UEFI", 5);
+        if ((type == 14 || type == 15) && !acpi_rsdp[0]) memcpy(acpi_rsdp, t + 8, 36);
+        if (type == 6) {                                       /* memory map: find the biggest free RAM area */
+            u32 esz = *(u32 *)(t + 8);
+            for (u8 *e = t + 16; e + esz <= t + size; e += esz) {
+                u64 base = *(u64 *)e, len = *(u64 *)(e + 8);
+                if (*(u32 *)(e + 16) != 1 || base >= 0xFFFFFFFFull) continue;
+                if (base + len > 0xFFFFF000ull) len = 0xFFFFF000ull - base;
+                u64 lo = base < kend ? kend : base;
+                if (lo >= base + len) continue;
+                u32 l = (u32)(base + len - lo);
+                if (l > best_len) { best_len = l; best_base = (u32)lo; }
+            }
+        }
         t += (size + 7) & ~7u;
     }
+    if (!fb_phys) halt();
+    /* keep the boot loader's info safe: start the heap after it if it sits inside our area */
+    u32 info_end = (info + *(u32 *)info + 0xFFF) & ~0xFFFu;
+    if (info >= best_base && info < best_base + best_len) { best_len -= info_end - best_base; best_base = info_end; }
+    heap_ptr = best_base; heap_end = best_base + best_len;
+    for (int i = 0; cmdline[i]; i++) if (!memcmp(cmdline + i, "safe", 4)) safe_mode = true;
+    usb_off = safe_mode;
+    if (safe_mode) anims_on = false;
+    fb = (u32 *)map_phys(fb_phys, fb_stride * 4 * (u32)PH);             /* the screen may live above 4 GB */
     if (!fb) halt();
-    W = imin(W, MAXW); H = imin(H, MAXH);
+    PW = imin(PW, 3840); PH = imin(PH, 2400);
+    BW = PW;
+    bb = kalloc((u32)(PW * PH * 4)); bgbuf = kalloc((u32)(PW * PH * 4));
+    snap_win = kalloc(700 * 560 * 4); snap_bg = kalloc(700 * 560 * 4);
+    filebuf = kalloc(FILEBUF_SIZE); ram_pool = kalloc(RSLOTS * RSLOT_SIZE);
+    if (!bb || !bgbuf || !snap_win || !snap_bg || !filebuf || !ram_pool) halt();
+    SCALE = (!safe_mode && PW >= 2400 && PH >= 1400) ? 2 : 1;           /* big screens: draw everything twice as big */
+    W = PW / SCALE; H = PH / SCALE;
     interrupts_init();
     ps2_init();
     sti();
+    acpi_init();
     boot_animation();
     rng ^= ms_now * 2654435761u;
     setup_windows();
@@ -2094,6 +2733,7 @@ void kmain(u32 magic, u32 info) {
     u32 last_clock = 0;
     for (;;) {
         int moved = 0;
+        usb_poll();
         while (ev_tail != ev_head) {
             u16 ev = evq[ev_tail]; ev_tail = (ev_tail + 1) & 1023;
             u8 d = (u8)ev;

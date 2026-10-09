@@ -20,5 +20,5 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-The fonts embedded in assets.h are derived from DejaVu Sans and are covered
-by their own license: see licenses/DejaVu-Fonts.txt.
+The fonts embedded in assets.h are derived from Inter (SIL Open Font License 1.1):
+see licenses/Inter-OFL.txt.

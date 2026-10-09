@@ -6,43 +6,52 @@ Designed by one person, coded with Claude, built and tested on an Android phone 
 
 ![FacetOS desktop](screenshots/desktop.png)
 
-## What's new in 1.2 "Prism"
+## What's new in 1.3
 
-FacetOS now has a look of its own:
+FacetOS now runs on modern PCs and laptops:
 
-- **Dark glass windows with cut corners**, like the facets of a gem, and a teal-to-violet **prism accent**
-- **The Prism Bar** — a floating bar at the bottom: the gem opens the app launcher, every app is one click away, and a glowing line shows which app is in front
-- **Window animations** — a shimmer of light when a window opens, and the window **shatters into pieces** when you close it (can be turned off in Settings)
-- **New boot animation** — a beam of light hits the gem and splits into a spectrum
-- **New icons, font (Inter) and cursor**, all designed for FacetOS
-- **Live mode** — FacetOS runs like a live USB: files you save go to the **Vault** and stay until you shut down
-- **Hardware detection** — the System app lists the disks, CD drives, SATA/NVMe/USB controllers it finds
-- **Safe by design** — FacetOS never formats or overwrites a disk. It only saves to a disk that is already a FacetOS disk
+- **UEFI boot** — starts on modern PCs (Secure Boot must be off), and still on old BIOS PCs and in the browser
+- **Any screen size** — FacetOS uses your screen's real resolution. Big screens (like 1440p and 4K) are shown at **2x** so text isn't tiny; you can switch in Settings
+- **USB keyboard and mouse** — a new USB 3 (xHCI) driver, so input works even when the PC has no PS/2 emulation
+- **Real power off and restart** using ACPI, the PC's own power tables
+- **Settings with tabs**: Appearance, Display, System (a hardware report with your USB devices) and Updates
+- **Keyboard shortcuts**: Win key opens the apps, Alt+Tab switches windows, Alt+F4 closes one
+- **Boot menu with Safe mode** — 1024 x 768, no USB driver, no animations, for PCs that have trouble
+- Devices placed above 4 GB of memory (common on UEFI PCs) are reached with PAE paging
+
+| Settings: hardware report | System |
+|---|---|
+| ![Settings](screenshots/settings.png) | ![System](screenshots/system.png) |
 
 | Apps | Launcher |
 |---|---|
 | ![Apps](screenshots/apps.png) | ![Launcher](screenshots/launcher.png) |
 
-| Boot: the light beam | Boot: starting up |
+| Boot: the light beam | Boot menu |
 |---|---|
-| ![Boot beam](screenshots/boot-beam.png) | ![Boot](screenshots/boot.png) |
-
-![System app showing the detected hardware](screenshots/system.png)
+| ![Boot beam](screenshots/boot-beam.png) | ![Boot menu](screenshots/bootmenu.png) |
 
 ## Apps
 
-**System** (hardware info and storage) · **Vault** (your files) · **Notes** · **Paint** · **Calculator** · **Puzzle** · **Settings** (wallpapers, animations) · **Read Me** · **Bin**
+**System** (hardware info and storage) · **Vault** (your files) · **Notes** · **Paint** · **Calculator** · **Puzzle** · **Settings** · **Read Me** · **Bin**
 
 ## Try it
 
 Download `facetos.iso` from the [Releases](../../releases) page, or build it yourself (below). Then boot it:
 
 - **In your browser with v86:** open [copy.sh/v86](https://copy.sh/v86/), choose `facetos.iso` as the **CD image**, press Start
-- **QEMU:** `qemu-system-x86_64 -cdrom facetos.iso -m 128`
+- **QEMU (BIOS):** `qemu-system-x86_64 -cdrom facetos.iso -m 256`
+- **QEMU (UEFI, USB):** `qemu-system-x86_64 -machine q35 -bios OVMF.fd -cdrom facetos.iso -m 256 -device qemu-xhci -device usb-kbd -device usb-mouse`
 - **VirtualBox:** new VM (Other, 32-bit), attach the ISO as a CD
-- **A real PC:** write the ISO to a USB stick with Rufus or Ventoy and boot from it. It runs as a live system; your disks are detected but never changed. (The mouse and keyboard need PS/2 or USB legacy support in the BIOS.)
+- **A real PC:** write the ISO to a USB stick with **Rufus** or **Ventoy** and boot from it. Turn **Secure Boot off** first. It runs as a live system; your disks are detected but never changed.
 
-FacetOS needs about 32 MB of memory.
+FacetOS needs about 64 MB of memory (128 MB when started with UEFI).
+
+### On a real PC
+
+- Plug the **USB keyboard and mouse straight into the PC** — devices behind a USB hub (or some keyboards with a built-in hub) don't work yet.
+- Most **laptop touchpads** aren't USB, so use a USB mouse.
+- If the screen or input misbehaves, pick **FacetOS 1.3 (Safe mode)** in the boot menu.
 
 ### Where do my files go?
 
@@ -55,7 +64,7 @@ FacetOS needs about 32 MB of memory.
 
 ```bash
 pkg install -y clang lld make git xorriso
-git clone https://github.com/thegreatbbd94-ux/facetos.git
+git clone https://github.com/YOUR-USERNAME/facetos.git
 cd facetos
 bash build.sh
 ```
@@ -64,19 +73,19 @@ bash build.sh
 
 Install `clang`, `lld`, `make`, `git` and `xorriso` with your package manager, then run `bash build.sh`.
 
-The build downloads the [Limine](https://github.com/limine-bootloader/limine) bootloader automatically and makes `facetos.iso`.
+The build downloads the [Limine](https://github.com/limine-bootloader/limine) bootloader automatically and makes `facetos.iso`, which boots on both BIOS and UEFI.
 
 ## How it works
 
 | File | What it does |
 |---|---|
-| `kernel.c` | The whole OS: boot, interrupts, drivers, file system, graphics, window manager, apps |
+| `kernel.c` | The whole OS: boot, interrupts, drivers (disk, PS/2, USB, ACPI), file system, graphics, window manager, apps |
 | `assets.h` | Fonts, icons and logo as data (generated by `tools/gen_assets.py`) |
 | `linker.ld` | Tells the linker to load the kernel at 2 MB |
-| `limine.conf` | Tells Limine to boot the kernel with the Multiboot2 protocol |
+| `limine.conf` | The boot menu: normal start and Safe mode, both using the Multiboot2 protocol |
 | `build.sh` | Compiles everything and makes the bootable ISO |
 
-Boot flow: **BIOS/UEFI → Limine → Multiboot2 → `kmain()`**. FacetOS sets up its own GDT and interrupt table, starts a 1000 Hz timer, reads the PS/2 keyboard and mouse through interrupts, scans the PCI bus, probes the ATA drives, and mounts the Vault. Everything on screen is drawn into a back buffer and only the changed parts are copied to the screen.
+Boot flow: **BIOS or UEFI → Limine → Multiboot2 → `kmain()`**. FacetOS reads the memory map, finds the ACPI tables and the framebuffer, sets up its own GDT and interrupt table, starts a 1000 Hz timer and reads the PS/2 keyboard and mouse through interrupts. It scans the PCI bus, probes the ATA drives, starts the USB 3 controller (resetting each port and asking every device what it is), and mounts the Vault. USB keyboard and mouse reports are translated into the same PS/2 codes the rest of the system already understands. Everything on screen is drawn into a back buffer and only the changed parts are copied to the screen (doubled at 2x).
 
 To change the icons or fonts, edit `tools/gen_assets.py` and run `python3 tools/gen_assets.py` (needs Python with Pillow).
 
@@ -84,11 +93,11 @@ To change the icons or fonts, edit `tools/gen_assets.py` and run `python3 tools/
 
 - [x] Interrupts, disk driver, FAT16 file system, saving
 - [x] A design language of its own ("Prism")
-- [ ] AHCI (SATA) and NVMe drivers, to read modern disks
-- [ ] USB keyboard and mouse
-- [ ] Folders in the Vault
-- [ ] Multitasking and separate app programs
-- [ ] Games
+- [x] UEFI, any resolution, USB keyboard and mouse, ACPI power off (1.3)
+- [ ] 1.4: internet through USB tethering from a phone, Ethernet, signed online updates
+- [ ] 1.5: read modern disks (SATA AHCI and NVMe), FAT32
+- [ ] 1.6: sound, Photos and Music apps
+- [ ] USB hubs, a 64-bit version, a web browser
 
 ## Credits
 
